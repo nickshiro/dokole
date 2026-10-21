@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"strconv"
 )
 
 type Config struct {
@@ -22,7 +21,7 @@ const (
 
 type Inbound struct {
 	Protocol InboundProtocol `json:"protocol"`
-	Port     int             `json:"port"`
+	Address  string          `json:"address"`
 	Settings json.RawMessage `json:"settings"`
 }
 
@@ -43,10 +42,6 @@ type Outbound struct {
 }
 
 var config Config
-
-const (
-	host = "127.0.0.1"
-)
 
 func routeAndDial(network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
@@ -110,14 +105,13 @@ func main() {
 	}
 
 	for _, in := range config.Inbounds {
-		address := net.JoinHostPort(host, strconv.Itoa(in.Port))
 		switch in.Protocol {
 		case TCP:
 			var settings TCPSettings
 			if err := json.Unmarshal(in.Settings, &settings); err != nil {
 				log.Fatal(err)
 			}
-			ln, err := net.Listen("tcp", address)
+			ln, err := net.Listen("tcp", in.Address)
 			if err != nil {
 				log.Fatal(err)
 			}
