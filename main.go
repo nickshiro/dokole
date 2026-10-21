@@ -4,14 +4,14 @@ import (
 	"encoding/json"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
-
-	"kalinka/tcp"
 )
 
 type Config struct {
-	Inbounds []InboundConfig `json:"inbounds"`
+	Inbounds  []Inbound  `json:"inbounds"`
+	Outbounds []Outbound `json:"outbounds"`
 }
 
 type InboundProtocol string
@@ -20,21 +20,71 @@ const (
 	TCP InboundProtocol = "tcp"
 )
 
-type InboundConfig struct {
+type Inbound struct {
 	Protocol InboundProtocol `json:"protocol"`
 	Port     int             `json:"port"`
 	Settings json.RawMessage `json:"settings"`
 }
 
 type TCPSettings struct {
-	Target string `json:"target"`
+	Destination string `json:"destination"`
 }
 
-var cfg Config
+type OutboundProtocol string
+
+const (
+	Direct OutboundProtocol = "direct"
+	Block  OutboundProtocol = "block"
+)
+
+type Outbound struct {
+	Protocol OutboundProtocol `json:"protocol"`
+	IP       []netip.Prefix   `json:"ip"`
+}
+
+var config Config
 
 const (
 	host = "127.0.0.1"
 )
+
+func routeAndDial(network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+
+	var outbound Outbound
+outer:
+	for i := 0; i < len(config.Outbounds); i++ {
+		outbound = config.Outbounds[i]
+		if len(outbound.IP) == 0 {
+			break
+		}
+		for _, ip := range ips {
+			aip, ok := netip.AddrFromSlice(ip)
+			if !ok {
+				panic("netip.AddrFromSlice(ip)")
+			}
+			aip = aip.Unmap()
+			for _, prefix := range outbound.IP {
+				if prefix.Contains(aip) {
+					address = net.JoinHostPort(ip.String(), port)
+					break outer
+				}
+			}
+		}
+	}
+	dial, ok := outboundDial[outbound.Protocol]
+	if !ok {
+		panic(outbound.Protocol)
+	}
+	return dial(network, address)
+}
 
 func main() {
 	log.SetPrefix(os.Args[0] + ": ")
@@ -43,37 +93,42 @@ func main() {
 	if len(os.Args) < 2 {
 		log.Fatalf("no config provided")
 	}
-	if err := readConfig(os.Args[1]); err != nil {
+	contents, err := os.ReadFile(os.Args[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := json.Unmarshal(contents, &config); err != nil {
 		log.Fatal(err)
 	}
 
-	if len(cfg.Inbounds) == 0 {
-		log.Fatal("at least one inbound is required")
+	// TODO(arkriny): maybe there should be some defaults so empty config works
+	if len(config.Inbounds) == 0 {
+		log.Fatal("no inbound specified")
 	}
-	for _, in := range cfg.Inbounds {
-		addr := net.JoinHostPort(host, strconv.Itoa(in.Port))
+	if len(config.Outbounds) == 0 {
+		log.Fatal("no outbound specified")
+	}
+
+	for _, in := range config.Inbounds {
+		address := net.JoinHostPort(host, strconv.Itoa(in.Port))
 		switch in.Protocol {
 		case TCP:
 			var settings TCPSettings
 			if err := json.Unmarshal(in.Settings, &settings); err != nil {
 				log.Fatal(err)
 			}
-			go tcp.Proxy(settings.Target, addr)
+			ln, err := net.Listen("tcp", address)
+			if err != nil {
+				log.Fatal(err)
+			}
+			p := TCPProxy{
+				Destination: settings.Destination,
+			}
+			go p.Serve(ln)
 
 		default:
-			log.Fatalf("unsupported protocol %q", in.Protocol)
+			log.Fatalf("unknown protocol %s", in.Protocol)
 		}
 	}
 	select {} // main loop
-}
-
-func readConfig(path string) error {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return err
-	}
-	return nil
 }

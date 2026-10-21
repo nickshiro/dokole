@@ -1,35 +1,32 @@
-package tcp
+package main
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 )
 
-func Proxy(dest, src string) error {
-	ln, err := net.Listen("tcp", src)
-	if err != nil {
-		return err
-	}
-	defer ln.Close()
+type TCPProxy struct {
+	Destination string
+}
 
+func (s *TCPProxy) Serve(ln net.Listener) error {
+	defer ln.Close()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return nil
-			}
 			return err
 		}
-		go handle(c, dest)
+		go s.handle(c)
 	}
 }
 
-func handle(c net.Conn, dest string) {
+func (s *TCPProxy) handle(c net.Conn) {
 	defer c.Close()
 
-	srv, err := net.Dial("tcp", dest)
+	srv, err := routeAndDial("tcp", s.Destination)
 	if err != nil {
 		return
 	}
@@ -39,10 +36,12 @@ func handle(c net.Conn, dest string) {
 	go func() { errc <- pump(srv, c) }()
 	go func() { errc <- pump(c, srv) }()
 
-	if err := <-errc; err != nil {
-		return
+	for range cap(errc) {
+		if err := <-errc; err != nil {
+			log.Print(err)
+			return
+		}
 	}
-	<-errc
 }
 
 func pump(dst, src net.Conn) error {
