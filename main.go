@@ -8,16 +8,27 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 )
 
 type Config struct {
+	Inbounds []InboundConfig `json:"inbounds"`
+}
+
+type InboundConfig struct {
+	Protocol string          `json:"protocol"`
+	Port     int             `json:"port"`
+	Settings json.RawMessage `json:"settings"`
+}
+
+type TCPSettings struct {
 	Target string `json:"target"`
 }
 
 var cfg Config
 
 const (
-	listenAddr = "127.0.0.1:1080"
+	listenHost = "127.0.0.1"
 )
 
 func main() {
@@ -32,33 +43,56 @@ func main() {
 		log.Fatal(err)
 	}
 
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Fatalf("listen on %s: %v", listenAddr, err)
+	for _, in := range cfg.Inbounds {
+		switch in.Protocol {
+		case "tcp":
+			var settings TCPSettings
+			if err := json.Unmarshal(in.Settings, &settings); err != nil {
+				log.Fatal(err)
+			}
+			addr := net.JoinHostPort(listenHost, strconv.Itoa(in.Port))
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				log.Fatal(err)
+			}
+			go serve(ln, settings.Target)
+
+		default:
+			log.Fatalf("unsupported protocol %q", in.Protocol)
+		}
 	}
+	for {
+	} // main loop
+}
+
+func loadConfig(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return err
+	}
+	if len(cfg.Inbounds) == 0 {
+		return fmt.Errorf("at least one inbound is required")
+	}
+	return nil
+}
+
+func serve(ln net.Listener, target string) {
 	defer ln.Close()
 
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			log.Fatalf("accept: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			log.Printf("accept on %s: %v", ln.Addr(), err)
+			return
 		}
-		go forward(c, cfg.Target)
+		go forward(c, target)
 	}
-}
-
-func loadConfig(path string) (error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("read config: %w", err)
-	}
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return fmt.Errorf("parse config %s: %w", path, err)
-	}
-	if cfg.Target == "" {
-		return fmt.Errorf("config %s: target is required", path)
-	}
-	return nil
 }
 
 func forward(c net.Conn, target string) {

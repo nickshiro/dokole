@@ -1,0 +1,11 @@
+{
+	"inbounds": [
+		{
+			"port": 1080,
+			"protocol": "tcp",
+			"settings": {
+				"target": "127.0.0.1:8000"
+			}
+		}
+	]
+}
