@@ -2,10 +2,7 @@
 	"inbounds": [
 		{
 			"address": "127.0.0.1:1080",
-			"protocol": "tcp",
-			"settings": {
-				"destination": "127.0.0.1:8000"
-			}
+			"protocol": "socks5"
 		}
 	],
 	"outbounds": [

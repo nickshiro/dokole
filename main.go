@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"kalinka/socks5"
 	"log"
 	"net"
 	"net/netip"
@@ -16,7 +18,8 @@ type Config struct {
 type InboundProtocol string
 
 const (
-	TCP InboundProtocol = "tcp"
+	TCP    InboundProtocol = "tcp"
+	SOCKS5 InboundProtocol = "socks5"
 )
 
 type Inbound struct {
@@ -105,20 +108,28 @@ func main() {
 	}
 
 	for _, in := range config.Inbounds {
+		ln, err := net.Listen("tcp", in.Address)
+		if err != nil {
+			log.Fatal(err)
+		}
 		switch in.Protocol {
 		case TCP:
 			var settings TCPSettings
 			if err := json.Unmarshal(in.Settings, &settings); err != nil {
 				log.Fatal(err)
 			}
-			ln, err := net.Listen("tcp", in.Address)
-			if err != nil {
-				log.Fatal(err)
-			}
 			p := TCPProxy{
 				Destination: settings.Destination,
 			}
 			go p.Serve(ln)
+
+		case SOCKS5:
+			s := socks5.Server{
+				Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+					return routeAndDial(network, address)
+				},
+			}
+			go s.Serve(ln)
 
 		default:
 			log.Fatalf("unknown protocol %s", in.Protocol)
