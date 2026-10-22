@@ -197,9 +197,16 @@ func TestDial_BadResponseVersion_ClosesConn(t *testing.T) {
 	})
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	if c, err := d.Dial("tcp", "1.2.3.4:80"); err == nil {
-		c.Close()
-		t.Fatal("expected error")
+	c, err := d.Dial("tcp", "1.2.3.4:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// The response header is read lazily, so the bad version is reported by
+	// the first Read rather than by Dial.
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected read error")
 	}
 
 	select {
@@ -216,13 +223,20 @@ func TestDial_ServerClosesBeforeResponse(t *testing.T) {
 	})
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	if c, err := d.Dial("tcp", "1.2.3.4:80"); err == nil {
-		c.Close()
-		t.Fatal("expected error")
+	c, err := d.Dial("tcp", "1.2.3.4:80")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// The server closed before sending the response header; the error appears
+	// on the first Read.
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("expected read error")
 	}
 }
 
-func TestDialContext_TimeoutDuringHandshake(t *testing.T) {
+func TestDialContext_DoesNotWaitForResponse(t *testing.T) {
 	srv := newServer(t, func(c net.Conn) { io.Copy(io.Discard, c) }) // reads but doesn’t respond
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -231,12 +245,12 @@ func TestDialContext_TimeoutDuringHandshake(t *testing.T) {
 	d := &Dialer{ID: testID, Address: srv.addr}
 	start := time.Now()
 	c, err := d.DialContext(ctx, "tcp", "example.com:80")
-	if err == nil {
-		c.Close()
-		t.Fatal("expected timeout error")
+	if err != nil {
+		t.Fatal(err)
 	}
+	defer c.Close()
 	if el := time.Since(start); el > 2*time.Second {
-		t.Fatalf("DialContext took %v, deadline was not applied to handshake", el)
+		t.Fatalf("DialContext took %v, it waited for the response header", el)
 	}
 }
 
@@ -307,7 +321,7 @@ func TestParseAddress(t *testing.T) {
 	tests := []struct {
 		in      string
 		wantTyp addrType
-		wantIP  string // "" для доменов
+		wantIP  string
 	}{
 		{"example.com", domainName, ""},
 		{"1.2.3.4", ipv4, "1.2.3.4"},

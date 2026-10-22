@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -56,17 +57,44 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 			c.Close()
 			return nil, err
 		}
-		if err := readResponse(c); err != nil {
-			c.Close()
-			return nil, err
-		}
+		// Do not wait for the response header here. Xray keeps that header
+		// buffered until the destination sends data, so waiting for it would
+		// deadlock protocols in which the client sends the first bytes.
 		c.SetDeadline(time.Time{})
 
-		return c, nil
+		return &Conn{Conn: c}, nil
 
 	default:
 		return nil, errors.New("vless: network not implemented: " + network)
 	}
+}
+
+// Conn is a proxied VLESS connection. The VLESS response header is read by the
+// first call to Read, because the server may not send it until the destination
+// has data to return.
+type Conn struct {
+	net.Conn
+
+	readMu       sync.Mutex
+	responseRead bool
+	responseErr  error
+}
+
+func (c *Conn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+
+	if !c.responseRead {
+		c.responseRead = true
+		c.responseErr = readResponse(c.Conn)
+		if c.responseErr != nil {
+			c.Conn.Close()
+		}
+	}
+	if c.responseErr != nil {
+		return 0, c.responseErr
+	}
+	return c.Conn.Read(p)
 }
 
 const version byte = 0
