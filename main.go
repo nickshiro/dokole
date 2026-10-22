@@ -54,13 +54,14 @@ type Outbound struct {
 	IP       []netip.Prefix   `json:"ip"`
 	Settings json.RawMessage  `json:"settings"`
 
-	dialer func(network, address string) (net.Conn, error)
+	dialer func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 func (o *Outbound) ResolveDialer() error {
 	switch o.Protocol {
 	case OutboundDirect:
-		o.dialer = net.Dial
+		var d net.Dialer
+		o.dialer = d.DialContext
 
 	case OutboundBlock:
 		o.dialer = dialBlock
@@ -78,7 +79,7 @@ func (o *Outbound) ResolveDialer() error {
 		if err != nil {
 			return err
 		}
-		o.dialer = d.Dial
+		o.dialer = d.(proxy.ContextDialer).DialContext
 
 	case OutboundVLESS:
 		var settings VLESSSettings
@@ -94,7 +95,7 @@ func (o *Outbound) ResolveDialer() error {
 			ID:      id,
 			Address: settings.Address,
 		}
-		o.dialer = d.Dial
+		o.dialer = d.DialContext
 
 	default:
 		return fmt.Errorf("unknown outbound %s", o.Protocol)
@@ -102,7 +103,7 @@ func (o *Outbound) ResolveDialer() error {
 	return nil
 }
 
-func dialBlock(network, address string) (net.Conn, error) {
+func dialBlock(ctx context.Context, network, address string) (net.Conn, error) {
 	return nil, errors.New("blocked")
 }
 
@@ -206,5 +207,5 @@ outer:
 			}
 		}
 	}
-	return ob.dialer(network, address)
+	return ob.dialer(ctx, network, address)
 }

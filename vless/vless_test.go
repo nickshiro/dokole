@@ -230,7 +230,7 @@ func TestDialContext_TimeoutDuringHandshake(t *testing.T) {
 
 	d := &Dialer{ID: testID, Address: srv.addr}
 	start := time.Now()
-	c, err := d.DialContex(ctx, "tcp", "example.com:80")
+	c, err := d.DialContext(ctx, "tcp", "example.com:80")
 	if err == nil {
 		c.Close()
 		t.Fatal("expected timeout error")
@@ -252,7 +252,7 @@ func TestDialContext_DeadlineClearedAfterHandshake(t *testing.T) {
 	defer cancel()
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	c, err := d.DialContex(ctx, "tcp", "1.2.3.4:80")
+	c, err := d.DialContext(ctx, "tcp", "1.2.3.4:80")
 	if err != nil {
 		t.Fatal(err)
 	}
