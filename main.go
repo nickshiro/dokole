@@ -9,9 +9,11 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"uuid"
 
 	"kalinka/socks5"
 	"kalinka/tcp"
+	"kalinka/vless"
 
 	"golang.org/x/net/proxy"
 )
@@ -44,6 +46,7 @@ const (
 	OutboundDirect OutboundProtocol = "direct"
 	OutboundBlock  OutboundProtocol = "block"
 	OutboundSOCKS5 OutboundProtocol = "socks5"
+	OutboundVLESS  OutboundProtocol = "vless"
 )
 
 type Outbound struct {
@@ -77,6 +80,22 @@ func (o *Outbound) ResolveDialer() error {
 		}
 		o.dialer = d.Dial
 
+	case OutboundVLESS:
+		var settings VLESSSettings
+		if err := json.Unmarshal(o.Settings, &settings); err != nil {
+			log.Fatal(err)
+		}
+		id, err := uuid.Parse(settings.ID)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		d := vless.Dialer{
+			ID:      id,
+			Address: settings.Address,
+		}
+		o.dialer = d.Dial
+
 	default:
 		return fmt.Errorf("unknown outbound %s", o.Protocol)
 	}
@@ -91,6 +110,11 @@ type SOCKS5Settings struct {
 	Address  string `json:"address"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type VLESSSettings struct {
+	Address string `json:"address"`
+	ID      string `json:"id"`
 }
 
 var config Config
