@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"kalinka/socks5"
 	"log"
 	"net"
 	"net/netip"
 	"os"
+
+	"golang.org/x/net/proxy"
 )
 
 type Config struct {
@@ -18,8 +21,8 @@ type Config struct {
 type InboundProtocol string
 
 const (
-	TCP    InboundProtocol = "tcp"
-	SOCKS5 InboundProtocol = "socks5"
+	InboundTCP    InboundProtocol = "tcp"
+	InboundSOCKS5 InboundProtocol = "socks5"
 )
 
 type Inbound struct {
@@ -35,16 +38,30 @@ type TCPSettings struct {
 type OutboundProtocol string
 
 const (
-	Direct OutboundProtocol = "direct"
-	Block  OutboundProtocol = "block"
+	OutboundDirect OutboundProtocol = "direct"
+	OutboundBlock  OutboundProtocol = "block"
+	OutboundSOCKS5 OutboundProtocol = "socks5"
 )
 
 type Outbound struct {
 	Protocol OutboundProtocol `json:"protocol"`
 	IP       []netip.Prefix   `json:"ip"`
+	Settings json.RawMessage  `json:"settings"`
+
+	dialer func(network, address string) (net.Conn, error)
+}
+
+type SOCKS5Settings struct {
+	Address  string `json:"address"`
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 var config Config
+
+func dialBlock(network, address string) (net.Conn, error) {
+	return nil, errors.New("blocked")
+}
 
 func routeAndDial(network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
@@ -77,11 +94,7 @@ outer:
 			}
 		}
 	}
-	dial, ok := outboundDial[outbound.Protocol]
-	if !ok {
-		panic(outbound.Protocol)
-	}
-	return dial(network, address)
+	return outbound.dialer(network, address)
 }
 
 func main() {
@@ -107,13 +120,40 @@ func main() {
 		log.Fatal("no outbound specified")
 	}
 
+	// Resolve outbound dialers
+	for i := range config.Outbounds {
+		outbound := &config.Outbounds[i]
+		switch outbound.Protocol {
+		case OutboundDirect:
+			outbound.dialer = net.Dial
+		case OutboundBlock:
+			outbound.dialer = dialBlock
+		case OutboundSOCKS5:
+			var settings SOCKS5Settings
+			if err := json.Unmarshal(outbound.Settings, &settings); err != nil {
+				log.Fatal(err)
+			}
+			auth := &proxy.Auth{
+				User:     settings.Username,
+				Password: settings.Password,
+			}
+			d, err := proxy.SOCKS5("tcp", settings.Address, auth, nil)
+			if err != nil {
+				log.Fatal(err)
+			}
+			outbound.dialer = d.Dial
+		default:
+			log.Fatalf("unknown outbound %s", outbound.Protocol)
+		}
+	}
+
 	for _, in := range config.Inbounds {
 		ln, err := net.Listen("tcp", in.Address)
 		if err != nil {
 			log.Fatal(err)
 		}
 		switch in.Protocol {
-		case TCP:
+		case InboundTCP:
 			var settings TCPSettings
 			if err := json.Unmarshal(in.Settings, &settings); err != nil {
 				log.Fatal(err)
@@ -123,7 +163,7 @@ func main() {
 			}
 			go p.Serve(ln)
 
-		case SOCKS5:
+		case InboundSOCKS5:
 			s := socks5.Server{
 				Dialer: func(ctx context.Context, network, address string) (net.Conn, error) {
 					return routeAndDial(network, address)

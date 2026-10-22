@@ -1,0 +1,16 @@
+{
+	"inbounds": [
+		{
+			"protocol": "socks5",
+			"address": "127.0.0.1:1080"
+		}
+	],
+	"outbounds": [
+		{
+			"protocol": "socks5",
+			"settings": {
+				"address": "example.com:1080"
+			}
+		}
+	]
+}
