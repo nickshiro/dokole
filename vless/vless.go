@@ -18,11 +18,7 @@ type Dialer struct {
 	Address string
 }
 
-func (d *Dialer) Dial(network, address string) (net.Conn, error) {
-	return d.DialContext(context.Background(), network, address)
-}
-
-func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (d *Dialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
 		host, port, err := splitHostPort(address)

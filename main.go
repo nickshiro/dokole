@@ -98,7 +98,7 @@ func (o *Outbound) ResolveDialer() error {
 			ID:      id,
 			Address: settings.Address,
 		}
-		o.dialer = d.DialContext
+		o.dialer = d.Dial
 
 	default:
 		return fmt.Errorf("unknown outbound %s", o.Protocol)

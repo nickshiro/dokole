@@ -83,7 +83,7 @@ func TestDial_WireFormat(t *testing.T) {
 			})
 
 			d := &Dialer{ID: testID, Address: srv.addr}
-			c, err := d.Dial("tcp", tt.address)
+			c, err := d.Dial(t.Context(), "tcp", tt.address)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -122,7 +122,7 @@ func TestDial_ResponseWithAddonsAndData(t *testing.T) {
 	})
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	c, err := d.Dial("tcp", "1.2.3.4:80")
+	c, err := d.Dial(t.Context(), "tcp", "1.2.3.4:80")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestDial_InvalidInput_NoConnection(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c, err := d.Dial(tt.network, tt.address)
+			c, err := d.Dial(t.Context(), tt.network, tt.address)
 			if err == nil {
 				c.Close()
 				t.Fatal("expected error")
@@ -178,7 +178,7 @@ func TestDial_ServerUnreachable(t *testing.T) {
 
 	d := &Dialer{ID: testID, Address: addr}
 	// the main thing is an error, not a panic on a nil connection
-	if c, err := d.Dial("tcp", "example.com:80"); err == nil {
+	if c, err := d.Dial(t.Context(), "tcp", "example.com:80"); err == nil {
 		c.Close()
 		t.Fatal("expected error")
 	}
@@ -197,7 +197,7 @@ func TestDial_BadResponseVersion_ClosesConn(t *testing.T) {
 	})
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	c, err := d.Dial("tcp", "1.2.3.4:80")
+	c, err := d.Dial(t.Context(), "tcp", "1.2.3.4:80")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestDial_ServerClosesBeforeResponse(t *testing.T) {
 	})
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	c, err := d.Dial("tcp", "1.2.3.4:80")
+	c, err := d.Dial(t.Context(), "tcp", "1.2.3.4:80")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +244,7 @@ func TestDialContext_DoesNotWaitForResponse(t *testing.T) {
 
 	d := &Dialer{ID: testID, Address: srv.addr}
 	start := time.Now()
-	c, err := d.DialContext(ctx, "tcp", "example.com:80")
+	c, err := d.Dial(ctx, "tcp", "example.com:80")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestDialContext_DeadlineClearedAfterHandshake(t *testing.T) {
 	defer cancel()
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	c, err := d.DialContext(ctx, "tcp", "1.2.3.4:80")
+	c, err := d.Dial(ctx, "tcp", "1.2.3.4:80")
 	if err != nil {
 		t.Fatal(err)
 	}
