@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"slices"
 	"strconv"
@@ -110,10 +111,13 @@ func (s *Server) Serve(ln net.Listener) error {
 		if err != nil {
 			return err
 		}
+		log.Printf("socks5: %s: accepted", c.RemoteAddr())
 		go func() {
 			defer c.Close()
 			conn := &Conn{clientConn: c, srv: s}
-			conn.Run()
+			if err := conn.Run(); err != nil {
+				log.Printf("socks5: %s: %v", c.RemoteAddr(), err)
+			}
 		}()
 	}
 }
@@ -147,10 +151,14 @@ func (c *Conn) Run() error {
 
 	err := parseClientGreeting(c.clientConn, authMethod)
 	if err != nil {
-		c.clientConn.Write([]byte{socks5Version, noAcceptableAuth})
-		return err
+		if _, werr := c.clientConn.Write([]byte{socks5Version, noAcceptableAuth}); werr != nil {
+			log.Printf("socks5: %s: send greeting rejection: %v", c.clientConn.RemoteAddr(), werr)
+		}
+		return fmt.Errorf("parse greeting: %w", err)
 	}
-	c.clientConn.Write([]byte{socks5Version, authMethod})
+	if _, err := c.clientConn.Write([]byte{socks5Version, authMethod}); err != nil {
+		return fmt.Errorf("send greeting response: %w", err)
+	}
 	if !needAuth {
 		return c.handleRequest()
 	}
@@ -391,6 +399,7 @@ func (c *Conn) transferUDP(associatedTCP net.Conn, clientConn net.PacketConn) er
 					if errors.Is(err, net.ErrClosed) {
 						return
 					}
+					log.Printf("socks5: %s: udp request: %v", c.clientConn.RemoteAddr(), err)
 				}
 			}
 		}
@@ -460,7 +469,7 @@ func (c *Conn) handleUDPRequest(
 	c.udpClientAddrMu.Unlock()
 	req, data, err := parseUDPRequest(buf[:n])
 	if err != nil {
-		return fmt.Errorf("parse udp request: %w", err)
+		return fmt.Errorf("parse udp request from %s: %w", addr, err)
 	}
 
 	targetConn, err := c.getOrDialTargetConn(ctx, clientConn, req.addr)
@@ -475,6 +484,7 @@ func (c *Conn) handleUDPRequest(
 	if nn != len(data) {
 		return fmt.Errorf("write to target %s fail: %w", req.addr, io.ErrShortWrite)
 	}
+	log.Printf("socks5: udp request %s -> %s (%d bytes)", addr, req.addr, nn)
 	return nil
 }
 
@@ -488,12 +498,12 @@ func (c *Conn) handleUDPResponse(
 	_ = targetConn.SetReadDeadline(time.Now().Add(readTimeout))
 	n, err := targetConn.Read(buf)
 	if err != nil {
-		return fmt.Errorf("read from target: %w", err)
+		return fmt.Errorf("read from target %s: %w", targetAddr, err)
 	}
 	hdr := udpRequest{addr: targetAddr}
 	pkt, err := hdr.marshal()
 	if err != nil {
-		return fmt.Errorf("marshal udp request: %w", err)
+		return fmt.Errorf("marshal udp request for %s: %w", targetAddr, err)
 	}
 	data := append(pkt, buf[:n]...)
 	// use addr from client to send back
@@ -502,11 +512,12 @@ func (c *Conn) handleUDPResponse(
 	c.udpClientAddrMu.Unlock()
 	nn, err := clientConn.WriteTo(data, addr)
 	if err != nil {
-		return fmt.Errorf("write to client: %w", err)
+		return fmt.Errorf("write to client %s: %w", addr, err)
 	}
 	if nn != len(data) {
-		return fmt.Errorf("write to client: %w", io.ErrShortWrite)
+		return fmt.Errorf("write to client %s: %w", addr, io.ErrShortWrite)
 	}
+	log.Printf("socks5: udp response %s -> %s (%d bytes)", targetAddr, addr, n)
 	return nil
 }
 
@@ -535,7 +546,7 @@ func parseClientGreeting(r io.Reader, authMethod byte) error {
 	var hdr [2]byte
 	_, err := io.ReadFull(r, hdr[:])
 	if err != nil {
-		return fmt.Errorf("could not read packet header")
+		return fmt.Errorf("could not read packet header: %w", err)
 	}
 	if hdr[0] != socks5Version {
 		return fmt.Errorf("incompatible SOCKS version")
@@ -544,7 +555,7 @@ func parseClientGreeting(r io.Reader, authMethod byte) error {
 	methods := make([]byte, count)
 	_, err = io.ReadFull(r, methods)
 	if err != nil {
-		return fmt.Errorf("could not read methods")
+		return fmt.Errorf("could not read methods: %w", err)
 	}
 	if slices.Contains(methods, authMethod) {
 		return nil
@@ -555,7 +566,7 @@ func parseClientGreeting(r io.Reader, authMethod byte) error {
 func parseClientAuth(r io.Reader) (usr, pwd string, err error) {
 	var hdr [2]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
-		return "", "", fmt.Errorf("could not read auth packet header")
+		return "", "", fmt.Errorf("could not read auth packet header: %w", err)
 	}
 	if hdr[0] != passwordAuthVersion {
 		return "", "", fmt.Errorf("bad SOCKS auth version")
@@ -563,16 +574,16 @@ func parseClientAuth(r io.Reader) (usr, pwd string, err error) {
 	usrLen := int(hdr[1])
 	usrBytes := make([]byte, usrLen)
 	if _, err := io.ReadFull(r, usrBytes); err != nil {
-		return "", "", fmt.Errorf("could not read auth packet username")
+		return "", "", fmt.Errorf("could not read auth packet username: %w", err)
 	}
 	var hdrPwd [1]byte
 	if _, err := io.ReadFull(r, hdrPwd[:]); err != nil {
-		return "", "", fmt.Errorf("could not read auth packet password length")
+		return "", "", fmt.Errorf("could not read auth packet password length: %w", err)
 	}
 	pwdLen := int(hdrPwd[0])
 	pwdBytes := make([]byte, pwdLen)
 	if _, err := io.ReadFull(r, pwdBytes); err != nil {
-		return "", "", fmt.Errorf("could not read auth packet password")
+		return "", "", fmt.Errorf("could not read auth packet password: %w", err)
 	}
 	return string(usrBytes), string(pwdBytes), nil
 }
@@ -600,7 +611,7 @@ func parseClientRequest(r io.Reader) (*request, error) {
 	var hdr [3]byte
 	_, err := io.ReadFull(r, hdr[:])
 	if err != nil {
-		return nil, fmt.Errorf("could not read packet header")
+		return nil, fmt.Errorf("could not read packet header: %w", err)
 	}
 	cmd := hdr[1]
 
@@ -623,7 +634,7 @@ func parseSocksAddr(r io.Reader) (addr socksAddr, err error) {
 	var addrTypeData [1]byte
 	_, err = io.ReadFull(r, addrTypeData[:])
 	if err != nil {
-		return socksAddr{}, fmt.Errorf("could not read address type")
+		return socksAddr{}, fmt.Errorf("could not read address type: %w", err)
 	}
 
 	dstAddrType := addrType(addrTypeData[0])
@@ -633,27 +644,27 @@ func parseSocksAddr(r io.Reader) (addr socksAddr, err error) {
 		var ip [4]byte
 		_, err = io.ReadFull(r, ip[:])
 		if err != nil {
-			return socksAddr{}, fmt.Errorf("could not read IPv4 address")
+			return socksAddr{}, fmt.Errorf("could not read IPv4 address: %w", err)
 		}
 		destination = net.IP(ip[:]).String()
 	case domainName:
 		var dstSizeByte [1]byte
 		_, err = io.ReadFull(r, dstSizeByte[:])
 		if err != nil {
-			return socksAddr{}, fmt.Errorf("could not read domain name size")
+			return socksAddr{}, fmt.Errorf("could not read domain name size: %w", err)
 		}
 		dstSize := int(dstSizeByte[0])
 		domainName := make([]byte, dstSize)
 		_, err = io.ReadFull(r, domainName)
 		if err != nil {
-			return socksAddr{}, fmt.Errorf("could not read domain name")
+			return socksAddr{}, fmt.Errorf("could not read domain name: %w", err)
 		}
 		destination = string(domainName)
 	case ipv6:
 		var ip [16]byte
 		_, err = io.ReadFull(r, ip[:])
 		if err != nil {
-			return socksAddr{}, fmt.Errorf("could not read IPv6 address")
+			return socksAddr{}, fmt.Errorf("could not read IPv6 address: %w", err)
 		}
 		destination = net.IP(ip[:]).String()
 	default:
@@ -662,7 +673,7 @@ func parseSocksAddr(r io.Reader) (addr socksAddr, err error) {
 	var portBytes [2]byte
 	_, err = io.ReadFull(r, portBytes[:])
 	if err != nil {
-		return socksAddr{}, fmt.Errorf("could not read port")
+		return socksAddr{}, fmt.Errorf("could not read port: %w", err)
 	}
 	port := binary.BigEndian.Uint16(portBytes[:])
 	return socksAddr{

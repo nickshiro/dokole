@@ -3,12 +3,13 @@ package tcp
 import (
 	"context"
 	"io"
+	"log"
 	"net"
 )
 
 // Server is a TCP proxy server.
 type Server struct {
-	// Destination address to which packets are proxied to.
+	// Destination address to which packets are proxied.
 	Destination string
 
 	// Dialer optionally specifies the dialer to use for outgoing connections.
@@ -32,6 +33,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		if err != nil {
 			return err
 		}
+		log.Printf("tcp: %s: accepted", c.RemoteAddr())
 		go s.proxy(c)
 	}
 }
@@ -39,21 +41,31 @@ func (s *Server) Serve(ln net.Listener) error {
 func (s *Server) proxy(c net.Conn) {
 	defer c.Close()
 
+	// TODO(arkriny): use timeout.
 	ctx := context.Background()
 	srv, err := s.dial(ctx, "tcp", s.Destination)
 	if err != nil {
+		log.Printf("tcp: %s: %v", c.RemoteAddr(), err)
 		return
 	}
 	defer srv.Close()
 
 	done := make(chan struct{})
 	go func() {
-		io.Copy(srv, c)
+		n, err := io.Copy(srv, c)
+		if err != nil {
+			log.Printf("tcp: %s: copy to %s failed after %d bytes: %v",
+				c.RemoteAddr(), s.Destination, n, err)
+		}
 		srv.(*net.TCPConn).CloseWrite()
 		close(done)
 	}()
 
-	io.Copy(c, srv)
+	n, err := io.Copy(c, srv)
+	if err != nil {
+		log.Printf("tcp: %s: copy from %s failed after %d bytes: %v",
+			c.RemoteAddr(), s.Destination, n, err)
+	}
 	c.(*net.TCPConn).CloseWrite()
 	<-done
 }
