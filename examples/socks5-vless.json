@@ -1,0 +1,15 @@
+{
+	"inbounds": [
+		{
+			"protocol": "socks5",
+			"address": "127.0.0.1:1080"
+		}
+	],
+	"outbounds": [
+		{
+			"protocol": "vless",
+			"address": "127.0.0.1:5005",
+			"uuid": "00000000-0000-0000-0000-000000000001"
+		}
+	]
+}
