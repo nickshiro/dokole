@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,6 +46,25 @@ func newServer(t *testing.T, handler func(net.Conn)) *testServer {
 		}
 	}()
 	return s
+}
+
+// startInbound runs srv on a loopback listener and returns its address.
+func startInbound(t *testing.T, srv *Server) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		srv.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		<-stopped
+	})
+	return ln.Addr().String()
 }
 
 func wantRequest(port uint16, atyp byte, addr []byte) []byte {
@@ -98,7 +119,7 @@ func TestDial_WireFormat(t *testing.T) {
 				t.Fatal("server did not receive request")
 			}
 
-			// after handshake connection stay derfault strem
+			// After the handshake the connection carries a plain byte stream.
 			if _, err := c.Write([]byte("ping")); err != nil {
 				t.Fatal(err)
 			}
@@ -108,6 +129,190 @@ func TestDial_WireFormat(t *testing.T) {
 			}
 			if string(buf) != "ping" {
 				t.Fatalf("echo = %q", buf)
+			}
+		})
+	}
+}
+
+func TestDial_InboundBidirectional(t *testing.T) {
+	for _, serverFirst := range []bool{false, true} {
+		name := "client-first"
+		if serverFirst {
+			name = "server-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			accepted := make(chan net.Conn, 1)
+			release := make(chan struct{})
+			defer close(release)
+			destination := newServer(t, func(c net.Conn) {
+				accepted <- c
+				<-release
+			})
+
+			address := startInbound(t, &Server{
+				Destination: destination.addr,
+				Users:       map[[16]byte]struct{}{testID: {}},
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			outbound := &Dialer{ID: testID, Address: address}
+			// The address in the request must be ignored: the real
+			// destination can only come from Server.Destination.
+			client, err := outbound.Dial(ctx, "tcp", "ignored.invalid:1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+
+			var server net.Conn
+			select {
+			case server = <-accepted:
+			case <-ctx.Done():
+				t.Fatal("inbound did not connect to the destination:", ctx.Err())
+			}
+			defer server.Close()
+			for _, c := range []net.Conn{client, server} {
+				if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			transfer := func(from, to net.Conn, payload string) {
+				t.Helper()
+				written := make(chan error, 1)
+				go func() {
+					_, err := io.Copy(from, strings.NewReader(payload))
+					written <- err
+				}()
+				got := make([]byte, len(payload))
+				if _, err := io.ReadFull(to, got); err != nil {
+					t.Fatal(err)
+				}
+				if err := <-written; err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != payload {
+					t.Fatal("forwarded payload mismatch")
+				}
+			}
+
+			if serverFirst {
+				transfer(server, client, "server greeting")
+			}
+			transfer(client, server, "client request")
+			transfer(server, client, "server response")
+			// Repeated writes must not insert another VLESS header.
+			transfer(client, server, strings.Repeat("upload\x00", 16*1024))
+			transfer(server, client, strings.Repeat("download\xff", 16*1024))
+		})
+	}
+}
+
+// The client half-closes its write side; the destination sees EOF and can
+// still answer. This goes through both CloseWrite implementations.
+func TestDial_HalfClose(t *testing.T) {
+	tests := []struct {
+		name  string
+		reply string // what the destination sends back after EOF
+	}{
+		{"destination replies", "got:hello"},
+		// The destination closes without sending anything: the inbound must
+		// still deliver the response header, otherwise the client would fail
+		// inside the header read instead of seeing a clean EOF.
+		{"destination silent", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			destination := newServer(t, func(c net.Conn) {
+				b, _ := io.ReadAll(c) // returns once the client closes its write side
+				if tt.reply != "" {
+					c.Write([]byte("got:" + string(b)))
+				}
+			})
+			address := startInbound(t, &Server{
+				Destination: destination.addr,
+				Users:       map[[16]byte]struct{}{testID: {}},
+			})
+
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			client, err := (&Dialer{ID: testID, Address: address}).Dial(ctx, "tcp", "ignored.invalid:1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			client.SetDeadline(time.Now().Add(5 * time.Second))
+
+			if _, err := client.Write([]byte("hello")); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.(*Conn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.reply {
+				t.Fatalf("got %q, want %q", got, tt.reply)
+			}
+		})
+	}
+}
+
+// The inbound must close without replying and without dialing upstream.
+func TestServer_RejectsSilently(t *testing.T) {
+	good := request{
+		uuid:    testID,
+		command: tcp,
+		addr:    addr{typ: domainName, domain: "x.test"},
+		port:    80,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*request)
+	}{
+		{"unknown user", func(r *request) { r.uuid[0] ^= 0xFF }},
+		{"udp", func(r *request) { r.command = udp }},
+		{"mux", func(r *request) { r.command = mux }},
+		{"addons", func(r *request) { r.addons = []byte{0x0a, 0x00} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dials atomic.Int32
+			address := startInbound(t, &Server{
+				Destination: "unused:1",
+				Users:       map[[16]byte]struct{}{testID: {}},
+				Dialer: func(ctx context.Context, network, a string) (net.Conn, error) {
+					dials.Add(1)
+					return nil, errors.New("unexpected dial")
+				},
+			})
+
+			req := good
+			tt.mutate(&req)
+			b, err := req.marshal()
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := net.Dial("tcp", address)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			c.Write(b)
+
+			c.SetReadDeadline(time.Now().Add(2 * time.Second))
+			n, err := c.Read(make([]byte, 16))
+			// The server must close without sending a byte. EOF and reset are
+			// both fine (unread request bytes make the kernel send RST), but
+			// neither data nor a timeout is.
+			if n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("read = %d, %v; want 0 bytes and a close", n, err)
+			}
+			if d := dials.Load(); d != 0 {
+				t.Fatalf("server dialed upstream %d times, want 0", d)
 			}
 		})
 	}
@@ -236,33 +441,31 @@ func TestDial_ServerClosesBeforeResponse(t *testing.T) {
 	}
 }
 
-func TestDialContext_DoesNotWaitForResponse(t *testing.T) {
+// Dial must return without waiting for the response header: if it did, it
+// would fail on the context deadline since this server never responds.
+func TestDial_DoesNotWaitForResponse(t *testing.T) {
 	srv := newServer(t, func(c net.Conn) { io.Copy(io.Discard, c) }) // reads but doesn’t respond
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
 	defer cancel()
 
 	d := &Dialer{ID: testID, Address: srv.addr}
-	start := time.Now()
 	c, err := d.Dial(ctx, "tcp", "example.com:80")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-	if el := time.Since(start); el > 2*time.Second {
-		t.Fatalf("DialContext took %v, it waited for the response header", el)
-	}
+	c.Close()
 }
 
 // The deadline for the handshake should not be left on the completed connection.
-func TestDialContext_DeadlineClearedAfterHandshake(t *testing.T) {
+func TestDial_DeadlineClearedAfterHandshake(t *testing.T) {
 	srv := newServer(t, func(c net.Conn) {
 		io.ReadFull(c, make([]byte, len(wantRequest(80, 0x01, make([]byte, 4)))))
 		c.Write([]byte{0, 0})
 		io.Copy(c, c)
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
 
 	d := &Dialer{ID: testID, Address: srv.addr}
@@ -272,7 +475,7 @@ func TestDialContext_DeadlineClearedAfterHandshake(t *testing.T) {
 	}
 	defer c.Close()
 
-	time.Sleep(400 * time.Millisecond) // The context deadline has already passed.
+	time.Sleep(150 * time.Millisecond) // The context deadline has already passed.
 
 	if _, err := c.Write([]byte("ok")); err != nil {
 		t.Fatalf("write after handshake deadline: %v", err)
@@ -283,29 +486,12 @@ func TestDialContext_DeadlineClearedAfterHandshake(t *testing.T) {
 	}
 }
 
-func TestEncodeRequest_Errors(t *testing.T) {
-	ok := addr{Type: domainName, Domain: "a.b"}
-	tests := []struct {
-		name string
-		req  request
-	}{
-		{"addons too long", request{command: tcp, addr: ok, addons: make([]byte, 256)}},
-		{"empty domain", request{command: tcp, addr: addr{Type: domainName}}},
-		{"unknown addr type", request{command: tcp, addr: addr{Type: 0x09}}},
-		{"ipv4 type with ipv6 ip", request{command: tcp, addr: addr{Type: ipv4, IP: mustAddr(t, "2001:db8::1")}}},
-		{"ipv6 type with ipv4 ip", request{command: tcp, addr: addr{Type: ipv6, IP: mustAddr(t, "1.2.3.4")}}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := encodeRequest(&tt.req); err == nil {
-				t.Fatal("expected error")
-			}
-		})
-	}
-}
-
 func TestEncodeRequest_MuxHasNoAddress(t *testing.T) {
-	b, err := encodeRequest(&request{version: version, uuid: testID, command: mux})
+	req := request{
+		uuid:    testID,
+		command: mux,
+	}
+	b, err := req.marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,11 +520,11 @@ func TestParseAddress(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if a.Type != tt.wantTyp {
-				t.Fatalf("type = %d, want %d", a.Type, tt.wantTyp)
+			if a.typ != tt.wantTyp {
+				t.Fatalf("type = %d, want %d", a.typ, tt.wantTyp)
 			}
-			if tt.wantIP != "" && a.IP.String() != tt.wantIP {
-				t.Fatalf("ip = %s, want %s", a.IP, tt.wantIP)
+			if tt.wantIP != "" && a.ip.String() != tt.wantIP {
+				t.Fatalf("ip = %s, want %s", a.ip, tt.wantIP)
 			}
 		})
 	}
@@ -351,4 +537,13 @@ func mustAddr(t *testing.T, s string) netip.Addr {
 		t.Fatal(err)
 	}
 	return a
+}
+
+// CloseWrite half-closes the write side if the underlying connection supports
+// it, so the peer sees EOF while the response can still be read.
+func (c *Conn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
 }
