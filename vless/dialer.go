@@ -2,9 +2,11 @@ package vless
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 	"sync"
@@ -30,49 +32,49 @@ func (d *Dialer) dial(ctx context.Context, network, addr string) (net.Conn, erro
 }
 
 func (d *Dialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	var cmd command
+
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		host, port, err := splitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		a := address{
-			addrType: getAddressType(host),
-			addr:     host,
-			port:     port,
-		}
-		req := request{
-			uuid: d.ID,
-			cmd:  tcp,
-			addr: a,
-		}
-		reqb, err := req.marshal()
-		if err != nil {
-			return nil, err
-		}
-
-		c, err := d.dial(ctx, "tcp", d.Address)
-		if err != nil {
-			return nil, err
-		}
-
-		if dl, ok := ctx.Deadline(); ok {
-			c.SetDeadline(dl)
-		}
-		if _, err := c.Write(reqb); err != nil {
-			c.Close()
-			return nil, err
-		}
-		// Do not wait for the response header here. Server may keep that header
-		// buffered until the destination sends data, so waiting for it would
-		// deadlock protocols in which the client sends the first bytes.
-		c.SetDeadline(time.Time{})
-
-		return &Conn{Conn: c}, nil
-
+		cmd = tcp
+	case "udp", "udp4", "udp6":
+		cmd = udp
 	default:
 		return nil, errors.New("vless: network not implemented: " + network)
 	}
+
+	host, port, err := splitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	req := request{
+		uuid: d.ID,
+		cmd:  cmd,
+		addr: address{addrType: getAddressType(host), addr: host, port: port},
+	}
+	reqb, err := req.marshal()
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := d.dial(ctx, "tcp", d.Address)
+	if err != nil {
+		return nil, err
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		c.SetDeadline(dl)
+	}
+	if _, err := c.Write(reqb); err != nil {
+		c.Close()
+		return nil, err
+	}
+	c.SetDeadline(time.Time{})
+
+	conn := &Conn{Conn: c}
+	if cmd == udp {
+		return &UdpConn{Conn: conn}, nil
+	}
+	return conn, nil
 }
 
 // Conn is a proxied VLESS connection.
@@ -84,10 +86,12 @@ type Conn struct {
 	responseErr  error
 }
 
-func (c *Conn) Read(p []byte) (int, error) {
-	c.readMu.Lock()
-	defer c.readMu.Unlock()
+type UdpConn struct {
+	*Conn
+	writeMu sync.Mutex
+}
 
+func (c *Conn) ensureResponse() error {
 	if !c.responseRead {
 		c.responseRead = true
 		c.responseErr = readResponse(c.Conn)
@@ -95,10 +99,62 @@ func (c *Conn) Read(p []byte) (int, error) {
 			c.Conn.Close()
 		}
 	}
-	if c.responseErr != nil {
-		return 0, c.responseErr
+	return c.responseErr
+}
+
+func (c *Conn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if err := c.ensureResponse(); err != nil {
+		return 0, err
 	}
 	return c.Conn.Read(p)
+}
+
+func (c *UdpConn) Write(p []byte) (int, error) {
+	if len(p) > math.MaxUint16 {
+		return 0, errors.New("vless: datagram too large")
+	}
+
+	buf := make([]byte, 2+len(p))
+	binary.BigEndian.PutUint16(buf, uint16(len(p)))
+	copy(buf[2:], p)
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if _, err := c.Conn.Conn.Write(buf); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *UdpConn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	if err := c.ensureResponse(); err != nil {
+		return 0, err
+	}
+
+	var hdr [2]byte
+	if _, err := io.ReadFull(c.Conn.Conn, hdr[:]); err != nil {
+		return 0, err
+	}
+	n := int(binary.BigEndian.Uint16(hdr[:]))
+
+	if n <= len(p) {
+		if _, err := io.ReadFull(c.Conn.Conn, p[:n]); err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+
+	if _, err := io.ReadFull(c.Conn.Conn, p); err != nil {
+		return 0, err
+	}
+	if _, err := io.CopyN(io.Discard, c.Conn.Conn, int64(n-len(p))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 func readResponse(r io.Reader) error {
