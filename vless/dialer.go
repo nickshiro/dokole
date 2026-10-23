@@ -37,7 +37,7 @@ func (d *Dialer) Dial(ctx context.Context, network, addr string) (net.Conn, erro
 			return nil, err
 		}
 		a := address{
-			addrType: getAddressType(addr),
+			addrType: getAddressType(host),
 			addr:     host,
 			port:     port,
 		}
@@ -125,42 +125,3 @@ func splitHostPort(hostport string) (string, uint16, error) {
 	}
 	return host, uint16(port), nil
 }
-
-func getAddressType(addr string) addressType {
-	if ip := net.ParseIP(addr); ip != nil {
-		if ip.To4() != nil {
-			return ipv4
-		}
-		return ipv6
-	}
-	return domainName
-}
-
-/*
-func parseAddress(address string) (addr, error) {
-	host, port, err := splitHostPort(address)
-	if err != nil {
-		return addr{}, err
-	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		return addr{
-			typ:    domainName,
-			host: address,
-			port:   port,
-		}, nil
-	}
-	if ip.Is4() || ip.Is4In6() {
-		return addr{
-			typ:  ipv4,
-			host:   ip.Unmap(),
-			port: port,
-		}, nil
-	}
-	return addr{
-		typ:  ipv6,
-		ip:   ip,
-		port: port,
-	}, nil
-}
-*/

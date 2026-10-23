@@ -85,3 +85,13 @@ func (req *request) marshal() ([]byte, error) {
 	}
 	return b, nil
 }
+
+func getAddressType(addr string) addressType {
+	if ip := net.ParseIP(addr); ip != nil {
+		if ip.To4() != nil {
+			return ipv4
+		}
+		return ipv6
+	}
+	return domainName
+}
