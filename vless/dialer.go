@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -30,22 +29,22 @@ func (d *Dialer) dial(ctx context.Context, network, addr string) (net.Conn, erro
 	return dial(ctx, network, addr)
 }
 
-func (d *Dialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+func (d *Dialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		host, port, err := splitHostPort(address)
+		host, port, err := splitHostPort(addr)
 		if err != nil {
 			return nil, err
 		}
-		target, err := parseAddress(host)
-		if err != nil {
-			return nil, err
+		a := address{
+			addrType: getAddressType(addr),
+			addr:     host,
+			port:     port,
 		}
 		req := request{
-			uuid:    d.ID,
-			command: tcp,
-			addr:    target,
-			port:    port,
+			uuid: d.ID,
+			cmd:  tcp,
+			addr: a,
 		}
 		reqb, err := req.marshal()
 		if err != nil {
@@ -127,13 +126,41 @@ func splitHostPort(hostport string) (string, uint16, error) {
 	return host, uint16(port), nil
 }
 
+func getAddressType(addr string) addressType {
+	if ip := net.ParseIP(addr); ip != nil {
+		if ip.To4() != nil {
+			return ipv4
+		}
+		return ipv6
+	}
+	return domainName
+}
+
+/*
 func parseAddress(address string) (addr, error) {
-	ip, err := netip.ParseAddr(address)
+	host, port, err := splitHostPort(address)
 	if err != nil {
-		return addr{typ: domainName, domain: address}, nil
+		return addr{}, err
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return addr{
+			typ:    domainName,
+			host: address,
+			port:   port,
+		}, nil
 	}
 	if ip.Is4() || ip.Is4In6() {
-		return addr{typ: ipv4, ip: ip.Unmap()}, nil
+		return addr{
+			typ:  ipv4,
+			host:   ip.Unmap(),
+			port: port,
+		}, nil
 	}
-	return addr{typ: ipv6, ip: ip}, nil
+	return addr{
+		typ:  ipv6,
+		ip:   ip,
+		port: port,
+	}, nil
 }
+*/

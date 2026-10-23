@@ -8,9 +8,10 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/netip"
+	"slices"
 	"sync"
 	"time"
+	"uuid"
 )
 
 const (
@@ -20,12 +21,9 @@ const (
 
 // Server is a VLESS inbound.
 type Server struct {
-	// Destination address to which packets are proxied.
-	Destination string
-
 	// Users is the set of allowed UUIDs. It must not be modified after Serve
 	// has been called.
-	Users map[[16]byte]struct{}
+	Users []uuid.UUID
 
 	// Dialer optionally specifies the dialer to use for outgoing connections.
 	// If nil, the net package's standard dialer is used.
@@ -63,7 +61,7 @@ func (s *Server) proxy(c net.Conn) {
 		log.Printf("vless: %s: bad request: %v", c.RemoteAddr(), err)
 		return
 	}
-	if _, ok := s.Users[req.uuid]; !ok {
+	if !slices.Contains(s.Users, req.uuid) {
 		log.Printf("vless: %s: unknown user", c.RemoteAddr())
 		return
 	}
@@ -71,15 +69,15 @@ func (s *Server) proxy(c net.Conn) {
 		log.Printf("vless: %s: addons not supported", c.RemoteAddr())
 		return
 	}
-	if req.command != tcp {
-		log.Printf("vless: %s: command %d not implemented", c.RemoteAddr(), req.command)
+	if req.cmd != tcp {
+		log.Printf("vless: %s: command %d not implemented", c.RemoteAddr(), req.cmd)
 		return
 	}
 	c.SetReadDeadline(time.Time{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
-	srv, err := s.dial(ctx, "tcp", s.Destination)
+	srv, err := s.dial(ctx, "tcp", req.addr.hostPort())
 	if err != nil {
 		log.Printf("vless: %s: %v", c.RemoteAddr(), err)
 		return
@@ -94,7 +92,7 @@ func (s *Server) proxy(c net.Conn) {
 		n, err := io.Copy(srv, c)
 		if err != nil {
 			log.Printf("vless: %s: copy to %s failed after %d bytes: %v",
-				c.RemoteAddr(), s.Destination, n, err)
+				c.RemoteAddr(), c.LocalAddr(), n, err)
 		}
 		closeWrite(srv)
 		close(done)
@@ -103,7 +101,7 @@ func (s *Server) proxy(c net.Conn) {
 	n, err := io.Copy(vc, srv)
 	if err != nil {
 		log.Printf("vless: %s: copy from %s failed after %d bytes: %v",
-			c.RemoteAddr(), s.Destination, n, err)
+			c.RemoteAddr(), c.LocalAddr(), n, err)
 	}
 	vc.CloseWrite()
 	<-done
@@ -168,18 +166,11 @@ func readRequest(r io.Reader) (*request, error) {
 	if _, err := io.ReadFull(r, ver[:]); err != nil {
 		return nil, err
 	}
-	/*
-		var h [18]byte // version, uuid, addons length
-		if _, err := io.ReadFull(r, h[:]); err != nil {
-			return nil, err
-		}
-	*/
 	if ver[0] != version {
 		return nil, fmt.Errorf("vless: unexpected request version %d", ver[0])
 	}
 
 	req := new(request)
-
 	if _, err := io.ReadFull(r, req.uuid[:]); err != nil {
 		return nil, err
 	}
@@ -200,8 +191,8 @@ func readRequest(r io.Reader) (*request, error) {
 	if _, err := io.ReadFull(r, cmd[:]); err != nil {
 		return nil, err
 	}
-	req.command = cmd[0]
-	if req.command == mux {
+	req.cmd = command(cmd[0])
+	if req.cmd == mux {
 		return req, nil
 	}
 
@@ -209,21 +200,23 @@ func readRequest(r io.Reader) (*request, error) {
 	if _, err := io.ReadFull(r, port[:]); err != nil {
 		return nil, err
 	}
-	req.port = binary.BigEndian.Uint16(port[:2])
+	req.addr.port = binary.BigEndian.Uint16(port[:2])
 
-	switch t := addrType(port[2]); t {
+	switch t := addressType(port[2]); t {
 	case ipv4:
-		var a [4]byte
-		if _, err := io.ReadFull(r, a[:]); err != nil {
+		var ip [4]byte
+		if _, err := io.ReadFull(r, ip[:]); err != nil {
 			return nil, err
 		}
-		req.addr = addr{typ: ipv4, ip: netip.AddrFrom4(a)}
+		req.addr.addrType = ipv4
+		req.addr.addr = net.IP(ip[:]).String()
 	case ipv6:
-		var a [16]byte
-		if _, err := io.ReadFull(r, a[:]); err != nil {
+		var ip [16]byte
+		if _, err := io.ReadFull(r, ip[:]); err != nil {
 			return nil, err
 		}
-		req.addr = addr{typ: ipv6, ip: netip.AddrFrom16(a)}
+		req.addr.addrType = ipv6
+		req.addr.addr = net.IP(ip[:]).String()
 	case domainName:
 		var l [1]byte
 		if _, err := io.ReadFull(r, l[:]); err != nil {
@@ -236,7 +229,8 @@ func readRequest(r io.Reader) (*request, error) {
 		if _, err := io.ReadFull(r, d); err != nil {
 			return nil, err
 		}
-		req.addr = addr{typ: domainName, domain: string(d)}
+		req.addr.addrType = domainName
+		req.addr.addr = string(d)
 	default:
 		return nil, fmt.Errorf("vless: unsupported address type %d", t)
 	}

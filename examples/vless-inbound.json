@@ -1,0 +1,16 @@
+{
+	"inbounds": [
+		{
+			"protocol": "vless",
+			"address": "127.0.0.1:5005",
+			"settings": {
+				"users": ["00000000-0000-0000-0000-000000000001"]
+			}
+		}
+	],
+	"outbounds": [
+		{
+			"protocol": "direct"
+		}
+	]
+}
